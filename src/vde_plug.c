@@ -21,6 +21,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <stdarg.h>
+#include <assert.h>
 
 #include <config.h>
 #include <vde.h>
@@ -52,6 +53,8 @@ struct utsname me;
 static struct passwd *callerpwd;
 #ifdef DO_SYSLOG
 static char host[256];
+
+static pid_t helper_pid;
 
 void write_syslog_entry(char *message)
 {
@@ -211,6 +214,7 @@ ssize_t vdeplug_recv(void *opaque, void *buf, size_t count)
 
 static void cleanup(void)
 {
+	if (helper_pid) kill(helper_pid, SIGKILL);
 	vdestream_close(vdestream);
   vde_close(conn);
 }
@@ -277,7 +281,8 @@ static void netusage() {
 }
 
 static void usage(char *progname) {
-	fprintf (stderr,"Usage: %s [-p portnum] [-g group] [-m mod] socketname\n\n",progname);
+	fprintf (stderr,"Usage: %s [-p portnum] [-g group] [-m mod] socketname "
+			"[helper args ...]\n\n",progname);
 	exit(-1);
 }
 
@@ -288,6 +293,7 @@ int main(int argc, char **argv)
 	static char *sockname=NULL;
 	ssize_t nx;
 	struct vde_open_args open_args={.port=0,.group=NULL,.mode=0700};
+	int spawn_helper = 0;
 
 	uname(&me);
 	//get the login name
@@ -367,18 +373,35 @@ int main(int argc, char **argv)
 			}
 		}
 
+		if (optind + (sockname==NULL) < argc)
+			spawn_helper = optind + (sockname==NULL);
 		if (optind < argc && sockname==NULL)
 			sockname=argv[optind];
 	}
 	atexit(cleanup);
 	setsighandlers();
+
+	int sv[2];
+	if (spawn_helper) {
+		assert(!socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+		pollv[0].fd = sv[0];
+		if (!(helper_pid = vfork())) {
+			assert(!close(sv[0]));
+			assert(dup2(sv[1], 3) == 3);
+			assert(!close(sv[1]));
+			assert(!execvp(argv[spawn_helper], &argv[spawn_helper]));
+		}
+	}
+
 	conn=vde_open(sockname,"vde_plug:",&open_args);
 	if (conn == NULL) {
 		fprintf(stderr,"vde_open %s: %s\n",sockname?sockname:"DEF_SWITCH",strerror(errno));
 		exit(1);
 	}
 
-	vdestream=vdestream_open(conn,STDOUT_FILENO,vdeplug_recv,vdeplug_err);
+	if (!spawn_helper) {
+		vdestream=vdestream_open(conn,STDOUT_FILENO,vdeplug_recv,vdeplug_err);
+	}
 
 	pollv[1].fd=vde_datafd(conn);
 	pollv[2].fd=vde_ctlfd(conn);
@@ -389,13 +412,21 @@ int main(int argc, char **argv)
 				pollv[2].revents & POLLIN)
 			break;
 		if (pollv[0].revents & POLLIN) {
-			nx=read(STDIN_FILENO,bufin,sizeof(bufin));
+			if (spawn_helper) {
+				nx=read(sv[0], bufin, sizeof(bufin));
+			} else {
+				nx=read(STDIN_FILENO,bufin,sizeof(bufin));
+			}
 			/* if POLLIN but not data it means that the stream has been
 			 * closed at the other end */
 			/*fprintf(stderr,"%s: RECV %d %x %x \n",myname,nx,bufin[0],bufin[1]);*/
 			if (nx==0)
 				break;
-			vdestream_recv(vdestream, bufin, nx);
+			if (spawn_helper) {
+				vde_send(conn, (char *)bufin, nx, 0);
+			} else {
+				vdestream_recv(vdestream, bufin, nx);
+			}
 		}
 		if (pollv[1].revents & POLLIN) {
 			nx=vde_recv(conn,bufin,BUFSIZE-2,0);
@@ -403,7 +434,11 @@ int main(int argc, char **argv)
 				perror("vde_plug: recvfrom ");
 			else
 			{
-				vdestream_send(vdestream, bufin, nx);
+				if (spawn_helper) {
+					write(sv[0], bufin, nx);
+				} else {
+					vdestream_send(vdestream, bufin, nx);
+				}
 				/*fprintf(stderr,"%s: SENT %d %x %x \n",myname,nx,bufin[0],bufin[1]);*/
 			}
 		}
