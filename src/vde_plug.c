@@ -21,6 +21,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <stdarg.h>
+#include <assert.h>
 
 #include <config.h>
 #include <vde.h>
@@ -52,6 +53,8 @@ struct utsname me;
 static struct passwd *callerpwd;
 #ifdef DO_SYSLOG
 static char host[256];
+
+static pid_t slirp_helper_pid;
 
 void write_syslog_entry(char *message)
 {
@@ -211,6 +214,7 @@ ssize_t vdeplug_recv(void *opaque, void *buf, size_t count)
 
 static void cleanup(void)
 {
+	if (slirp_helper_pid) kill(slirp_helper_pid, SIGKILL);
 	vdestream_close(vdestream);
   vde_close(conn);
 }
@@ -293,6 +297,8 @@ int main(int argc, char **argv)
 	//get the login name
 	callerpwd=getpwuid(getuid());
 
+	int spawn_slirp_helper = 0;
+
 	if (argv[0][0] == '-')
 		netusage(); //implies exit
 	/* option parsing */
@@ -309,9 +315,10 @@ int main(int argc, char **argv)
 				{"help",0,0,'h'},
 				{"mod",1,0,'m'},
 				{"group",1,0,'g'},
+				{"slirp-helper", 0, 0, 'S'},
 				{0, 0, 0, 0}
 			};
-			c = GETOPT_LONG (argc, argv, "hc:p:s:m:g:l",
+			c = GETOPT_LONG (argc, argv, "hc:p:s:m:g:lS",
 					long_options, &option_index);
 			if (c == -1)
 				break;
@@ -362,6 +369,10 @@ int main(int argc, char **argv)
 					break;
 #endif
 
+				case 'S':
+					spawn_slirp_helper = 1;
+					break;
+
 				default:
 					usage(argv[0]); //implies exit
 			}
@@ -372,13 +383,28 @@ int main(int argc, char **argv)
 	}
 	atexit(cleanup);
 	setsighandlers();
+
+	int sv[2];
+	if (spawn_slirp_helper) {
+		assert(!socketpair(AF_UNIX, SOCK_DGRAM, 0, sv));
+		char arg[16];
+		assert(snprintf(arg, sizeof arg, "--fd=%i", sv[0]) < (int)sizeof arg);
+		pollv[0].fd = sv[1];
+		if (!(slirp_helper_pid = vfork())) {
+			assert(!close(sv[1]));
+			assert(!execlp("slirp-helper", "slirp-helper", arg, "--debug", (void *)0));
+		}
+	}
+
 	conn=vde_open(sockname,"vde_plug:",&open_args);
 	if (conn == NULL) {
 		fprintf(stderr,"vde_open %s: %s\n",sockname?sockname:"DEF_SWITCH",strerror(errno));
 		exit(1);
 	}
 
-	vdestream=vdestream_open(conn,STDOUT_FILENO,vdeplug_recv,vdeplug_err);
+	if (!spawn_slirp_helper) {
+		vdestream=vdestream_open(conn,STDOUT_FILENO,vdeplug_recv,vdeplug_err);
+	}
 
 	pollv[1].fd=vde_datafd(conn);
 	pollv[2].fd=vde_ctlfd(conn);
@@ -389,13 +415,21 @@ int main(int argc, char **argv)
 				pollv[2].revents & POLLIN)
 			break;
 		if (pollv[0].revents & POLLIN) {
-			nx=read(STDIN_FILENO,bufin,sizeof(bufin));
+			if (spawn_slirp_helper) {
+				nx=read(sv[1], bufin, sizeof(bufin));
+			} else {
+				nx=read(STDIN_FILENO,bufin,sizeof(bufin));
+			}
 			/* if POLLIN but not data it means that the stream has been
 			 * closed at the other end */
 			/*fprintf(stderr,"%s: RECV %d %x %x \n",myname,nx,bufin[0],bufin[1]);*/
 			if (nx==0)
 				break;
-			vdestream_recv(vdestream, bufin, nx);
+			if (spawn_slirp_helper) {
+				vde_send(conn, (char *)bufin, nx, 0);
+			} else {
+				vdestream_recv(vdestream, bufin, nx);
+			}
 		}
 		if (pollv[1].revents & POLLIN) {
 			nx=vde_recv(conn,bufin,BUFSIZE-2,0);
@@ -403,7 +437,11 @@ int main(int argc, char **argv)
 				perror("vde_plug: recvfrom ");
 			else
 			{
-				vdestream_send(vdestream, bufin, nx);
+				if (spawn_slirp_helper) {
+					write(sv[1], bufin, nx);
+				} else {
+					vdestream_send(vdestream, bufin, nx);
+				}
 				/*fprintf(stderr,"%s: SENT %d %x %x \n",myname,nx,bufin[0],bufin[1]);*/
 			}
 		}
